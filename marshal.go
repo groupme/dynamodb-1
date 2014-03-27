@@ -58,38 +58,52 @@ var (
 )
 
 type fieldInfo struct {
-	kind  int
-	index int
-	name  string
+	kind    int
+	index   int
+	name    string
+	keyType string
 }
 
-func encode(v interface{}, buf *bytes.Buffer) {
-
-	if item, ok := v.(Item); ok {
-		item.Encode(buf)
-		return
-	}
-
+func getTypeInfo(v interface{}) ([]*fieldInfo, reflect.Value) {
 	rv := reflect.ValueOf(v)
 	if !rv.IsValid() {
-		panic("cannot encode invalid value")
+		panic("cannot encode/decode invalid value")
 	}
-	rt := rv.Type()
 
+	rt := rv.Type()
 	mutex.RLock()
 	fields, present := typeInfo[rt]
 	mutex.RUnlock()
 	if !present {
 		fields = compile(rt)
 	}
+	rv = rv.Elem()
+	return fields, rv
+}
+
+func encode(v interface{}, buf *bytes.Buffer, asKey bool, expected bool) {
+	if item, ok := v.(Item); ok {
+		item.Encode(buf)
+		return
+	}
+
+	fields, rv := getTypeInfo(v)
 
 	close := `{"`
-	last := len(fields) - 1
-	rv = rv.Elem()
+
 	written := false
 
+	if asKey == true {
+		var keyFields []*fieldInfo
+		for _, field := range fields {
+			if field.keyType != "" {
+				keyFields = append(keyFields, field)
+			}
+		}
+		fields = keyFields
+	}
+	last := len(fields) - 1
 	for idx, field := range fields {
-
 		dbKind := kindMap[field.kind]
 		prefix := `"`
 		suffix := `"`
@@ -98,14 +112,20 @@ func encode(v interface{}, buf *bytes.Buffer) {
 			prefix = "["
 			suffix = "]"
 		}
-
-		fmt.Fprintf(buf, `%s%s":{"%s":%s`, close, field.name, dbKind, prefix)
+		if expected == false {
+			fmt.Fprintf(buf, `%s%s":{"%s":%s`, close, field.name, dbKind, prefix)
+		} else {
+			fmt.Fprintf(buf, `%s%s":{"Value":{"%s":%s`, close, field.name, dbKind, prefix)
+		}
 		comma := ","
 		if idx == last {
 			comma = ""
 		}
-
-		close = fmt.Sprintf(`%s}%s"`, suffix, comma)
+		if expected == false {
+			close = fmt.Sprintf(`%s}%s"`, suffix, comma)
+		} else {
+			close = fmt.Sprintf(`%s}}%s"`, suffix, comma)
+		}
 		written = true
 
 		fv := rv.Field(field.index)
@@ -222,27 +242,15 @@ func encode(v interface{}, buf *bytes.Buffer) {
 
 }
 
-func decode(v interface{}, data map[string]map[string]interface{}) {
+func decode(v interface{}, data DynamoItem) {
 
 	if item, ok := v.(Item); ok {
 		item.Decode(data)
 		return
 	}
 
-	rv := reflect.ValueOf(v)
-	if !rv.IsValid() {
-		panic("cannot decode into invalid value")
-	}
-	rt := rv.Type()
+	fields, rv := getTypeInfo(v)
 
-	mutex.RLock()
-	fields, present := typeInfo[rt]
-	mutex.RUnlock()
-	if !present {
-		fields = compile(rt)
-	}
-
-	rv = rv.Elem()
 	for _, field := range fields {
 		switch field.kind {
 		case binaryField, boolField, intField, int64Field, stringField, timeField, uintField, uint64Field:
@@ -361,12 +369,14 @@ func compile(it reflect.Type) []*fieldInfo {
 			continue
 		}
 		name := ""
+		// why? what is the ddb tag for?
 		if tag := field.Tag.Get("ddb"); tag != "" {
 			if tag == "-" {
 				continue
 			}
 			name = tag
 		}
+		keyType := field.Tag.Get("keyType")
 		if name == "" {
 			name = field.Name
 			rune, _ := utf8.DecodeRuneInString(name)
@@ -418,9 +428,10 @@ func compile(it reflect.Type) []*fieldInfo {
 			panic("dynamodb: unsupported field type: " + field.Type.Elem().Kind().String())
 		}
 		fields = append(fields, &fieldInfo{
-			kind:  kind,
-			index: i,
-			name:  name,
+			kind:    kind,
+			index:   i,
+			name:    name,
+			keyType: keyType,
 		})
 
 	}

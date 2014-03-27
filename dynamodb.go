@@ -67,6 +67,11 @@
 //     })
 package dynamodb
 
+// TODO:
+// query + index creation & management
+// ERRORS and error handling
+// (batch write / get)
+
 import (
 	"bytes"
 	"crypto/hmac"
@@ -74,7 +79,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/tav/golly/tlsconf"
+	"log"
+	//"github.com/tav/golly/tlsconf"
+	"errors"
 	"io/ioutil"
 	"net/http"
 	"strings"
@@ -222,7 +229,7 @@ func (e Error) Info() (errtype string, message string) {
 // default implementation.
 type Item interface {
 	Encode(buf *bytes.Buffer)
-	Decode(data map[string]map[string]interface{})
+	Decode(data DynamoItem)
 }
 
 type Key struct {
@@ -292,23 +299,68 @@ type Table struct {
 
 // Get fetches and populates the item.
 func (t *Table) Get(item interface{}, consistent bool) error {
-	// return c.RawRequest("GetItem", payload)
-	return nil
+	payload := &bytes.Buffer{}
+	encodedKey := bytes.Buffer{}
+	encode(item, &encodedKey, true, false)
+	fmt.Fprintf(payload, `{"TableName":"%s", "Key":%s, "ConsistentRead":%t}`, t.name, encodedKey.String(), consistent)
+	resp, err := t.client.RawRequest("GetItem", payload.Bytes())
+	if err != nil {
+		return err
+	}
+	var getData GetItem
+	err = json.Unmarshal(resp, &getData)
+	if getData.Item == nil {
+		return errors.New("Item does not exist")
+	}
+	decode(item, getData.Item)
+	return err
 }
 
-func (t *Table) Delete(item interface{}) error {
-	// return c.RawRequest("DeleteItem", payload)
-	return nil
+func (t *Table) Del(item interface{}) error {
+	payload := &bytes.Buffer{}
+	encodedKey := bytes.Buffer{}
+	encode(item, &encodedKey, true, false)
+	fmt.Fprintf(payload, `{"TableName":"%s", "Key":%s}`, t.name, encodedKey.String())
+	_, err := t.client.RawRequest("DeleteItem", payload.Bytes())
+	return err
 }
 
 func (t *Table) Put(item interface{}) error {
-	// return c.RawRequest("PutItem", payload)
-	return nil
+	payload := &bytes.Buffer{}
+	encodedItem := bytes.Buffer{}
+	encode(item, &encodedItem, false, false)
+	fmt.Fprintf(payload, `{"TableName":"%s", "Item":%s}`, t.name, encodedItem.String())
+	_, err := t.client.RawRequest("PutItem", payload.Bytes())
+	return err
 }
 
-func (t *Table) PutIf(key Key) error {
-	// return c.RawRequest("PutItem", payload)
-	return nil
+func (t *Table) PutIf(newItem, oldItem interface{}) error {
+	// only put if item hasn't  changed
+	payload := &bytes.Buffer{}
+	encodedNewItem := bytes.Buffer{}
+	encodedOldItem := bytes.Buffer{}
+	encode(newItem, &encodedNewItem, false, false)
+	encode(oldItem, &encodedOldItem, false, true)
+	fmt.Fprintf(payload, `{"TableName":"%s", "Item":%s, "Expected":%s}`, t.name, encodedNewItem.String(), encodedOldItem.String())
+	_, err := t.client.RawRequest("PutItem", payload.Bytes())
+	return err
+}
+
+func (t *Table) Add(item interface{}) error {
+	// only put if the key doesn't already exist
+	payload := &bytes.Buffer{}
+	encodedItem := bytes.Buffer{}
+	encode(item, &encodedItem, false, false)
+	fields, _ := getTypeInfo(item)
+	var keyStrings []string
+	for _, field := range fields {
+		if field.keyType != "" {
+			keyStrings = append(keyStrings, fmt.Sprintf(`"%s": {"Exists":false}`, field.name))
+		}
+	}
+	fmt.Fprintf(payload, `{"TableName":"%s", "Item":%s, "Expected":{%s}}`, t.name, encodedItem.String(), strings.Join(keyStrings, ", "))
+	_, err := t.client.RawRequest("PutItem", payload.Bytes())
+	return err
 }
 
 func (t *Table) Query() *Query {
@@ -326,20 +378,87 @@ type Client struct {
 	web      *http.Client
 }
 
+var tables map[string]*Table
+
+func (c *Client) Table(name string) *Table {
+	if tables[name] != nil {
+		return tables[name]
+	}
+	return &Table{
+		client: c,
+		name:   name,
+	}
+}
+
+func (c *Client) CreateTable(name string, itemStruct interface{}, readCapacity, writeCapacity int, globalIndexes []GlobalIndex, localIndexes []Index) (*TableDesc, error) {
+	var keys []KeyItem
+	var attrDefs []AttributeDefinition
+	fields, _ := getTypeInfo(itemStruct)
+	for _, field := range fields {
+		if field.keyType != "" {
+			keys = append(keys, KeyItem{AttributeName: field.name, KeyType: field.keyType})
+			attrDefs = append(attrDefs, AttributeDefinition{AttributeName: field.name, AttributeType: kindMap[field.kind]})
+		}
+	}
+
+	payload, err := c.Call("CreateTable", TableCreate{attrDefs, keys, globalIndexes, localIndexes, ProvisionedThroughput{readCapacity, writeCapacity}, name})
+	if err != nil {
+		return nil, err
+	}
+	var t TableResponseWrapper
+	err = json.Unmarshal(payload, &t)
+	return &t.TableDescription, err
+}
+
+func (c *Client) ListTables(limit int, cursor string) (tables TablesList, err error) {
+	args := Map{}
+	if limit != 0 {
+		args["Limit"] = limit
+	}
+	if cursor != "" {
+		args["ExclusiveStartTable"] = cursor
+	}
+	payload, err := c.Call("ListTables", args)
+	if err != nil {
+		return
+	}
+	err = json.Unmarshal(payload, &tables)
+	return
+}
+
+func (c *Client) DescribeTable(name string) (*TableDesc, error) {
+	payload, err := c.Call("DescribeTable", Map{"TableName": name})
+	if err != nil {
+		return nil, err
+	}
+	var t TableDescWrapper
+	err = json.Unmarshal(payload, &t)
+	return &t.Table, err
+}
+
+func (c *Client) DeleteTable(name string) (*TableDesc, error) {
+	payload, err := c.Call("DeleteTable", Map{"TableName": name})
+	if err != nil {
+		return nil, err
+	}
+	var t TableResponseWrapper
+	err = json.Unmarshal(payload, &t)
+	return &t.TableDescription, err
+}
+
+func (c *Client) UpdateTable(name string, ReadCapacityUnits, WriteCapacityUnits int, IndexUpdates []GlobalIndexUpdate) (*TableDesc, error) {
+	tabUp := TableUpdate{IndexUpdates, ProvisionedThroughput{ReadCapacityUnits, WriteCapacityUnits}, name}
+	payload, err := c.Call("UpdateTable", tabUp)
+	if err != nil {
+		return nil, err
+	}
+	var t TableResponseWrapper
+	err = json.Unmarshal(payload, &t)
+	return &t.TableDescription, err
+}
+
 // Call does the heavy-lifting of initiating a DynamoDB API
-// call and parsing the JSON response into a map.
-//
-// It's best to call certain API methods directly using this
-// method:
-//
-//  - CreateTable
-//  - DescribeTable
-//  - DeleteTable
-//  - ListTables
-//  - UpdateTable
-//
-func (c *Client) Call(method string, params Map) (resp Map, err error) {
-	var payload []byte
+func (c *Client) Call(method string, params interface{}) (payload []byte, err error) {
 	if params == nil {
 		payload = []byte{'{', '}'}
 	} else {
@@ -348,78 +467,8 @@ func (c *Client) Call(method string, params Map) (resp Map, err error) {
 			return
 		}
 	}
-	// fmt.Println("PAYLOAD: ", string(payload))
 	payload, err = c.RawRequest(method, payload)
-	// fmt.Println("RESP PAYLOAD: ", string(payload))
-	if err != nil {
-		return
-	}
-	resp = Map{}
-	err = json.Unmarshal(payload, &resp)
 	return
-}
-
-func (c *Client) Table(name string) *Table {
-	return &Table{
-		client: c,
-		name:   name,
-	}
-}
-
-func (c *Client) CreateTable(name string, itemSchema interface{}, readCapacity, writeCapacity int) error {
-	return nil
-}
-
-func (c *Client) DeleteTable(name string) error {
-	// d := &TableDescription{}
-	// Map{"TableDescription": d}
-	return nil
-}
-
-func (c *Client) DescribeTable(name string) (table *TableDescription, err error) {
-	d := &TableDescription{}
-	// Map{"Table": d}
-	return d, nil
-}
-
-func (c *Client) ListTables(cursor string) (tables []string, nextCursor string, err error) {
-	return
-}
-
-type TableDescription struct {
-	AttributeDefinitions []struct {
-		AttributeName string
-		AttributeType string
-	}
-	CreationDateTime int
-	ItemCount        int
-	KeySchema        []struct {
-		AttributeName string
-		KeyType       string
-	}
-	LocalSecondaryIndexes []struct {
-		IndexName      string
-		IndexSizeBytes int
-		ItemCount      int
-		KeySchema      []struct {
-			AttributeName string
-			KeyType       string
-		}
-		Projection struct {
-			NonKeyAttributes []string
-			ProjectionType   string
-		}
-	}
-	ProvisionedThroughput struct {
-		LastDecreaseDateTime   int
-		LastIncreaseDateTime   int
-		NumberOfDecreasesToday int
-		ReadCapacityUnits      int
-		WriteCapacityUnits     int
-	}
-	TableName      string
-	TableSizeBytes int
-	TableStatus    string
 }
 
 // TODO(tav): Minimise string allocation by writing to a
@@ -455,10 +504,12 @@ func (c *Client) RawRequest(method string, payload []byte) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode != 200 {
-		return nil, Error{
+		err := Error{
 			Body:       body,
 			StatusCode: resp.StatusCode,
 		}
+		log.Printf("%v", string(body))
+		return nil, err
 	}
 	return body, nil
 }
@@ -471,7 +522,8 @@ func doHMAC(key []byte, data string) []byte {
 
 func Dial(region endpoint, creds auth, transport http.RoundTripper) *Client {
 	if transport == nil {
-		transport = &http.Transport{TLSClientConfig: tlsconf.Config}
+		transport = &http.Transport{}
+		//transport = &http.Transport{TLSClientConfig: tlsconf.Config}
 	}
 	return &Client{
 		auth:     creds,
