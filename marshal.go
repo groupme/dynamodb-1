@@ -242,7 +242,7 @@ func encode(v interface{}, buf *bytes.Buffer, asKey bool, expected bool) {
 
 }
 
-func decode(v interface{}, data DynamoItem) {
+func decode(v interface{}, data ResponseItem) {
 
 	if item, ok := v.(Item); ok {
 		item.Decode(data)

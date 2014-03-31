@@ -78,11 +78,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"log"
-	//"github.com/tav/golly/tlsconf"
 	"errors"
+	"fmt"
+	"github.com/tav/golly/tlsconf"
 	"io/ioutil"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -229,7 +229,7 @@ func (e Error) Info() (errtype string, message string) {
 // default implementation.
 type Item interface {
 	Encode(buf *bytes.Buffer)
-	Decode(data DynamoItem)
+	Decode(data ResponseItem)
 }
 
 type Key struct {
@@ -316,7 +316,7 @@ func (t *Table) Get(item interface{}, consistent bool) error {
 	return err
 }
 
-func (t *Table) Del(item interface{}) error {
+func (t *Table) Delete(item interface{}) error {
 	payload := &bytes.Buffer{}
 	encodedKey := bytes.Buffer{}
 	encode(item, &encodedKey, true, false)
@@ -390,10 +390,10 @@ func (c *Client) Table(name string) *Table {
 	}
 }
 
-func (c *Client) CreateTable(name string, itemStruct interface{}, readCapacity, writeCapacity int, globalIndexes []GlobalIndex, localIndexes []Index) (*TableDesc, error) {
+func (c *Client) CreateTable(name string, schemaItem interface{}, readCapacity, writeCapacity int, globalIndexes []GlobalIndex, localIndexes []Index) (*TableDesc, error) {
 	var keys []KeyItem
 	var attrDefs []AttributeDefinition
-	fields, _ := getTypeInfo(itemStruct)
+	fields, _ := getTypeInfo(schemaItem)
 	for _, field := range fields {
 		if field.keyType != "" {
 			keys = append(keys, KeyItem{AttributeName: field.name, KeyType: field.keyType})
@@ -522,8 +522,7 @@ func doHMAC(key []byte, data string) []byte {
 
 func Dial(region endpoint, creds auth, transport http.RoundTripper) *Client {
 	if transport == nil {
-		transport = &http.Transport{}
-		//transport = &http.Transport{TLSClientConfig: tlsconf.Config}
+		transport = &http.Transport{TLSClientConfig: tlsconf.Config}
 	}
 	return &Client{
 		auth:     creds,

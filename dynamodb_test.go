@@ -31,7 +31,7 @@ func TestDynamo(t *testing.T) {
 		log.Fatal("Failed to put or get the item")
 	}
 	delI := MyItem{Name: "Tom"}
-	err := table.Del(&delI)
+	err := table.Delete(&delI)
 	if err != nil {
 		log.Fatal("Failed to delete the item")
 	}

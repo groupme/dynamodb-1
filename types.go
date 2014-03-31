@@ -93,9 +93,8 @@ type TableResponseWrapper struct {
 	TableDescription TableDesc
 }
 
-type DynamoItem map[string]map[string]interface{}
-type DynamoKey DynamoItem
+type ResponseItem map[string]map[string]interface{}
 
 type GetItem struct {
-	Item DynamoItem
+	Item ResponseItem
 }
