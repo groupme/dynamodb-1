@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 	"unicode"
@@ -308,6 +309,7 @@ func decode(v interface{}, data ResponseItem) {
 					nv := make([]bool, len(vals))
 					for j, val := range vals {
 						if val == "1" {
+
 							nv[j] = true
 						} else if val == "0" {
 							nv[j] = false
@@ -369,14 +371,20 @@ func compile(it reflect.Type) []*fieldInfo {
 			continue
 		}
 		name := ""
-		// why? what is the ddb tag for?
+		keyType := ""
 		if tag := field.Tag.Get("ddb"); tag != "" {
+			split := strings.Split(tag, ",")
+			if len(split) == 2 {
+				keyType = split[1]
+				tag = split[0]
+			} else {
+				tag = split[0]
+			}
 			if tag == "-" {
 				continue
 			}
 			name = tag
 		}
-		keyType := field.Tag.Get("keyType")
 		if name == "" {
 			name = field.Name
 			rune, _ := utf8.DecodeRuneInString(name)

@@ -6,7 +6,7 @@ import (
 )
 
 type MyItem struct {
-	Name   string `keyType:"HASH"`
+	Name   string `ddb:"MyItem2,HASH"`
 	Weight int
 	Height int
 }
@@ -17,7 +17,10 @@ func TestDynamo(t *testing.T) {
 	dbClient := Dial(endpoint, auth, nil)
 
 	dbClient.DeleteTable("Test")
-	dbClient.CreateTable("Test", &MyItem{}, 10, 10, nil, nil)
+	_, err := dbClient.CreateTable("Test", &MyItem{}, 10, 10, nil, nil)
+	if err != nil {
+		log.Printf("%v", err)
+	}
 	testT, _ := dbClient.DescribeTable("Test")
 	if testT.TableStatus != "ACTIVE" {
 		log.Fatal("Error creating table")
@@ -31,7 +34,7 @@ func TestDynamo(t *testing.T) {
 		log.Fatal("Failed to put or get the item")
 	}
 	delI := MyItem{Name: "Tom"}
-	err := table.Delete(&delI)
+	err = table.Delete(&delI)
 	if err != nil {
 		log.Fatal("Failed to delete the item")
 	}
