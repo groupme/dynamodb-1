@@ -80,7 +80,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/tav/golly/tlsconf"
 	"io/ioutil"
 	"log"
 	"net/http"
@@ -522,7 +521,7 @@ func doHMAC(key []byte, data string) []byte {
 
 func Dial(region endpoint, creds auth, transport http.RoundTripper) *Client {
 	if transport == nil {
-		transport = &http.Transport{TLSClientConfig: tlsconf.Config}
+		transport = &http.Transport{}
 	}
 	return &Client{
 		auth:     creds,

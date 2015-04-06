@@ -2,7 +2,10 @@ package dynamodb
 
 import (
 	"log"
+	"net/url"
 	"testing"
+
+	"github.com/groupme/dynamo/dynamotest"
 )
 
 type MyItem struct {
@@ -12,12 +15,20 @@ type MyItem struct {
 }
 
 func TestDynamo(t *testing.T) {
+	db, err := dynamotest.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	dbURL, _ := url.Parse(db.URL())
+
 	auth := Auth("your-access-key", "your-secret-key")
-	endpoint := EndPoint("DynamoDB Local", "home", "localhost:8000", false)
+	endpoint := EndPoint("DynamoDB Local", "local", dbURL.Host, false)
 	dbClient := Dial(endpoint, auth, nil)
 
 	dbClient.DeleteTable("Test")
-	_, err := dbClient.CreateTable("Test", &MyItem{}, 10, 10, nil, nil)
+	_, err = dbClient.CreateTable("Test", &MyItem{}, 10, 10, nil, nil)
 	if err != nil {
 		log.Printf("%v", err)
 	}
