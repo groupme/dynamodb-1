@@ -82,6 +82,12 @@ func getTypeInfo(v interface{}) ([]*fieldInfo, reflect.Value) {
 	return fields, rv
 }
 
+func Marshal(v interface{}) ([]byte, error) {
+	var buf bytes.Buffer
+	encode(v, &buf, false, false)
+	return buf.Bytes(), nil
+}
+
 func encode(v interface{}, buf *bytes.Buffer, asKey bool, expected bool) {
 	if item, ok := v.(Item); ok {
 		item.Encode(buf)
