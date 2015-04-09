@@ -1,0 +1,17 @@
+{
+	"ImportPath": "github.com/groupme/dynamodb-1",
+	"GoVersion": "go1.4.1",
+	"Packages": [
+		"./..."
+	],
+	"Deps": [
+		{
+			"ImportPath": "github.com/groupme/dynamo/dynamotest",
+			"Rev": "08be2f9cb5aca8eb1cf10f035211f093ced355a6"
+		},
+		{
+			"ImportPath": "golang.org/x/net/context",
+			"Rev": "5b4754d96d73efe14f882d2f14ae3d29f7b2a67d"
+		}
+	]
+}

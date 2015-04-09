@@ -21,7 +21,7 @@
 // instance for development, define your own custom
 // endpoint, e.g.
 //
-//     endpoint := dynamodb.EndPoint("DynamoDB Local", "home", "localhost:8000", false)
+//     endpoint := dynamodb.EndPoint("Test", "local", "localhost:8000", false)
 //
 // You are now ready to Dial the endpoint and instantiate a client:
 //
@@ -45,26 +45,32 @@
 //
 //     client := dynamodb.Dial(endpoint, auth, transport)
 //
+// In high throughput applications, you may see increased performance by
+// increasing the number of connections available to the Client, e.g.
+//
+// 		transport := &http.Transport{MaxIdleConnsPerHost: 64}
+//		client := dynamodb.Dial(endpoint, auth, transport)
+//
 // The heart of the package revolves around the Client. You
 // instantiate it by calling Dial with an endpoint and
 // authentication details, e.g.
 //
+//		import "dynamodb"
 //
-//     import "dynamodb"
+// 		auth := dynamodb.Auth("your-access-key", "your-secret-key")
+//		client := dynamodb.Dial(dynamodb.USWest1, auth, nil)
 //
-//     auth := dynamodb.Auth("your-access-key", "your-secret-key")
-//     client := dynamodb.Dial(dynamodb.USWest1, secret, nil)
+//		query := table.Query()
+//		query.Sort('-').Limit(20)
 //
-//     query := table.Query()
-//     query.Sort('-').Limit(20)
-//
-//     resp, err := client.Call("CreateTable", dynamodb.Map{
+//		resp, err := client.Call("CreateTable", dynamodb.Map{
 //         "TableName": "mytable",
 //         "ProvisionedThroughput": dynamodb.Map{
 //             "ReadCapacityUnits": 5,
 //             "WriteCapacityUnits": 5,
 //         },
 //     })
+//
 package dynamodb
 
 // TODO:
@@ -82,10 +88,16 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 	"time"
+
+	"golang.org/x/net/context"
 )
+
+// ErrRetryExhausted is returned when MaxRetry is reached
+var ErrRetryExhausted = errors.New("dynamodb: retry exhausted")
 
 const (
 	iso8601 = "20060102T150405Z"
@@ -186,6 +198,21 @@ func (e Error) Info() (errtype string, message string) {
 		errtype = errtype[idx+1:]
 	}
 	return errtype, info["message"]
+}
+
+// Retry returns error is safe to retry
+func (e Error) Retry() bool {
+	errtype, _ := e.Info()
+	switch errtype {
+	case "InternalServerError":
+		return true
+	case "ProvisionedThroughputExceededException":
+		return true
+	case "ServiceUnavailableException":
+		return true
+	default:
+		return false
+	}
 }
 
 // Item specifies an interface for encoding and decoding a
@@ -291,18 +318,60 @@ func (q *Query) WithCursor(key Key) *Query {
 	return q
 }
 
+// Session helps perform multiple Table operations on a Context
+type Session struct {
+	ctx   context.Context
+	table *Table
+}
+
+func (s *Session) Get(item interface{}, consistent bool) error {
+	return s.table.Get(s.ctx, item, consistent)
+}
+
+func (s *Session) Delete(item interface{}) error {
+	return s.table.Delete(s.ctx, item)
+}
+
+func (s *Session) Put(item interface{}) error {
+	return s.table.Put(s.ctx, item)
+}
+
+func (s *Session) PutIf(newItem, oldItem interface{}) error {
+	return s.table.PutIf(s.ctx, newItem, oldItem)
+}
+
+func (s *Session) Add(item interface{}) error {
+	return s.table.Add(s.ctx, item)
+}
+
+// Table operates on a named DynamoDB table
 type Table struct {
 	client *Client
 	name   string
 }
 
+// Session creates a new Session for Context and Table
+func (t *Table) Session(ctx context.Context) *Session {
+	return &Session{ctx: ctx, table: t}
+}
+
 // Get fetches and populates the item.
-func (t *Table) Get(item interface{}, consistent bool) error {
+func (t *Table) Get(
+	ctx context.Context,
+	item interface{},
+	consistent bool,
+) error {
 	payload := &bytes.Buffer{}
 	encodedKey := bytes.Buffer{}
 	encode(item, &encodedKey, true, false)
-	fmt.Fprintf(payload, `{"TableName":"%s", "Key":%s, "ConsistentRead":%t}`, t.name, encodedKey.String(), consistent)
-	resp, err := t.client.RawRequest("GetItem", payload.Bytes())
+	fmt.Fprintf(
+		payload,
+		`{"TableName":"%s", "Key":%s, "ConsistentRead":%t}`,
+		t.name,
+		encodedKey.String(),
+		consistent,
+	)
+	resp, err := t.client.CallBytes(ctx, "GetItem", payload.Bytes())
 	if err != nil {
 		return err
 	}
@@ -315,38 +384,55 @@ func (t *Table) Get(item interface{}, consistent bool) error {
 	return err
 }
 
-func (t *Table) Delete(item interface{}) error {
+func (t *Table) Delete(ctx context.Context, item interface{}) error {
 	payload := &bytes.Buffer{}
 	encodedKey := bytes.Buffer{}
 	encode(item, &encodedKey, true, false)
-	fmt.Fprintf(payload, `{"TableName":"%s", "Key":%s}`, t.name, encodedKey.String())
-	_, err := t.client.RawRequest("DeleteItem", payload.Bytes())
+	fmt.Fprintf(
+		payload,
+		`{"TableName":"%s", "Key":%s}`,
+		t.name,
+		encodedKey.String(),
+	)
+	_, err := t.client.CallBytes(ctx, "DeleteItem", payload.Bytes())
 	return err
 }
 
-func (t *Table) Put(item interface{}) error {
+// Put puts item
+func (t *Table) Put(ctx context.Context, item interface{}) error {
 	payload := &bytes.Buffer{}
 	encodedItem := bytes.Buffer{}
 	encode(item, &encodedItem, false, false)
-	fmt.Fprintf(payload, `{"TableName":"%s", "Item":%s}`, t.name, encodedItem.String())
-	_, err := t.client.RawRequest("PutItem", payload.Bytes())
+	fmt.Fprintf(
+		payload,
+		`{"TableName":"%s", "Item":%s}`,
+		t.name,
+		encodedItem.String(),
+	)
+	_, err := t.client.CallBytes(ctx, "PutItem", payload.Bytes())
 	return err
 }
 
-func (t *Table) PutIf(newItem, oldItem interface{}) error {
-	// only put if item hasn't  changed
+// PutIf only puts if item hasn't changed
+func (t *Table) PutIf(ctx context.Context, newItem, oldItem interface{}) error {
 	payload := &bytes.Buffer{}
 	encodedNewItem := bytes.Buffer{}
 	encodedOldItem := bytes.Buffer{}
 	encode(newItem, &encodedNewItem, false, false)
 	encode(oldItem, &encodedOldItem, false, true)
-	fmt.Fprintf(payload, `{"TableName":"%s", "Item":%s, "Expected":%s}`, t.name, encodedNewItem.String(), encodedOldItem.String())
-	_, err := t.client.RawRequest("PutItem", payload.Bytes())
+	fmt.Fprintf(
+		payload,
+		`{"TableName":"%s", "Item":%s, "Expected":%s}`,
+		t.name,
+		encodedNewItem.String(),
+		encodedOldItem.String(),
+	)
+	_, err := t.client.CallBytes(ctx, "PutItem", payload.Bytes())
 	return err
 }
 
-func (t *Table) Add(item interface{}) error {
-	// only put if the key doesn't already exist
+// Add puts item if the key doesn't already exist
+func (t *Table) Add(ctx context.Context, item interface{}) error {
 	payload := &bytes.Buffer{}
 	encodedItem := bytes.Buffer{}
 	encode(item, &encodedItem, false, false)
@@ -357,28 +443,66 @@ func (t *Table) Add(item interface{}) error {
 			keyStrings = append(keyStrings, fmt.Sprintf(`"%s": {"Exists":false}`, field.name))
 		}
 	}
-	fmt.Fprintf(payload, `{"TableName":"%s", "Item":%s, "Expected":{%s}}`, t.name, encodedItem.String(), strings.Join(keyStrings, ", "))
-	_, err := t.client.RawRequest("PutItem", payload.Bytes())
+	fmt.Fprintf(
+		payload,
+		`{"TableName":"%s", "Item":%s, "Expected":{%s}}`,
+		t.name,
+		encodedItem.String(),
+		strings.Join(keyStrings, ", "),
+	)
+	_, err := t.client.CallBytes(ctx, "PutItem", payload.Bytes())
 	return err
 }
 
+// TODO implement me
 func (t *Table) Query() *Query {
 	return &Query{}
 }
 
+// TODO implement me
 func (t *Table) Update(key Key) error {
 	// return c.RawRequest("UpdateItem", payload)
 	return nil
 }
 
-type Client struct {
-	auth     auth
-	endpoint endpoint
-	web      *http.Client
+const (
+	RetryDefault int = 5
+	RetryForever     = -1
+	RetryNever       = 0
+)
+
+// Dial creates a new Client
+func Dial(region endpoint, creds auth, transport http.RoundTripper) *Client {
+	if transport == nil {
+		transport = &http.Transport{}
+	}
+	return &Client{
+		Retry:     RetryDefault,
+		auth:      creds,
+		endpoint:  region,
+		web:       &http.Client{Transport: transport},
+		transport: transport,
+	}
 }
 
+// Client communicates over HTTP
+type Client struct {
+	// Retry defines retry behavior.
+	// If > 0, Client exponentially backs off and retrys to limit.
+	// If 0, Client does not retry.
+	// If -1, Client retries forever.
+	Retry int
+
+	auth      auth
+	endpoint  endpoint
+	web       *http.Client
+	transport http.RoundTripper
+}
+
+// memoize tables
 var tables map[string]*Table
 
+// Table gets or initializes *Table
 func (c *Client) Table(name string) *Table {
 	if tables[name] != nil {
 		return tables[name]
@@ -389,27 +513,64 @@ func (c *Client) Table(name string) *Table {
 	}
 }
 
-func (c *Client) CreateTable(name string, schemaItem interface{}, readCapacity, writeCapacity int, globalIndexes []GlobalIndex, localIndexes []Index) (*TableDesc, error) {
+func (c *Client) CreateTable(
+	ctx context.Context,
+	name string,
+	schemaItem interface{},
+	readCapacity int,
+	writeCapacity int,
+	globalIndexes []GlobalIndex,
+	localIndexes []Index,
+) (*TableDesc, error) {
 	var keys []KeyItem
 	var attrDefs []AttributeDefinition
 	fields, _ := getTypeInfo(schemaItem)
 	for _, field := range fields {
 		if field.keyType != "" {
-			keys = append(keys, KeyItem{AttributeName: field.name, KeyType: field.keyType})
-			attrDefs = append(attrDefs, AttributeDefinition{AttributeName: field.name, AttributeType: kindMap[field.kind]})
+			keys = append(
+				keys,
+				KeyItem{
+					AttributeName: field.name,
+					KeyType:       field.keyType,
+				},
+			)
+
+			attrDefs = append(
+				attrDefs,
+				AttributeDefinition{
+					AttributeName: field.name,
+					AttributeType: kindMap[field.kind],
+				},
+			)
 		}
 	}
 
-	payload, err := c.Call("CreateTable", TableCreate{attrDefs, keys, globalIndexes, localIndexes, ProvisionedThroughput{readCapacity, writeCapacity}, name})
+	payload, err := c.Call(
+		ctx,
+		"CreateTable",
+		TableCreate{
+			attrDefs,
+			keys,
+			globalIndexes,
+			localIndexes,
+			ProvisionedThroughput{readCapacity, writeCapacity},
+			name,
+		},
+	)
 	if err != nil {
 		return nil, err
 	}
+
 	var t TableResponseWrapper
 	err = json.Unmarshal(payload, &t)
 	return &t.TableDescription, err
 }
 
-func (c *Client) ListTables(limit int, cursor string) (tables TablesList, err error) {
+func (c *Client) ListTables(
+	ctx context.Context,
+	limit int,
+	cursor string,
+) (tables TablesList, err error) {
 	args := Map{}
 	if limit != 0 {
 		args["Limit"] = limit
@@ -417,7 +578,7 @@ func (c *Client) ListTables(limit int, cursor string) (tables TablesList, err er
 	if cursor != "" {
 		args["ExclusiveStartTable"] = cursor
 	}
-	payload, err := c.Call("ListTables", args)
+	payload, err := c.Call(ctx, "ListTables", args)
 	if err != nil {
 		return
 	}
@@ -425,8 +586,11 @@ func (c *Client) ListTables(limit int, cursor string) (tables TablesList, err er
 	return
 }
 
-func (c *Client) DescribeTable(name string) (*TableDesc, error) {
-	payload, err := c.Call("DescribeTable", Map{"TableName": name})
+func (c *Client) DescribeTable(
+	ctx context.Context,
+	name string,
+) (*TableDesc, error) {
+	payload, err := c.Call(ctx, "DescribeTable", Map{"TableName": name})
 	if err != nil {
 		return nil, err
 	}
@@ -435,8 +599,11 @@ func (c *Client) DescribeTable(name string) (*TableDesc, error) {
 	return &t.Table, err
 }
 
-func (c *Client) DeleteTable(name string) (*TableDesc, error) {
-	payload, err := c.Call("DeleteTable", Map{"TableName": name})
+func (c *Client) DeleteTable(
+	ctx context.Context,
+	name string,
+) (*TableDesc, error) {
+	payload, err := c.Call(ctx, "DeleteTable", Map{"TableName": name})
 	if err != nil {
 		return nil, err
 	}
@@ -445,9 +612,19 @@ func (c *Client) DeleteTable(name string) (*TableDesc, error) {
 	return &t.TableDescription, err
 }
 
-func (c *Client) UpdateTable(name string, ReadCapacityUnits, WriteCapacityUnits int, IndexUpdates []GlobalIndexUpdate) (*TableDesc, error) {
-	tabUp := TableUpdate{IndexUpdates, ProvisionedThroughput{ReadCapacityUnits, WriteCapacityUnits}, name}
-	payload, err := c.Call("UpdateTable", tabUp)
+func (c *Client) UpdateTable(
+	ctx context.Context,
+	name string,
+	ReadCapacityUnits int,
+	WriteCapacityUnits int,
+	IndexUpdates []GlobalIndexUpdate,
+) (*TableDesc, error) {
+	tabUp := TableUpdate{
+		IndexUpdates,
+		ProvisionedThroughput{ReadCapacityUnits, WriteCapacityUnits},
+		name,
+	}
+	payload, err := c.Call(ctx, "UpdateTable", tabUp)
 	if err != nil {
 		return nil, err
 	}
@@ -456,23 +633,98 @@ func (c *Client) UpdateTable(name string, ReadCapacityUnits, WriteCapacityUnits 
 	return &t.TableDescription, err
 }
 
-// Call does the heavy-lifting of initiating a DynamoDB API
-func (c *Client) Call(method string, params interface{}) (payload []byte, err error) {
+// Call makes request with params marshalled to JSON
+func (c *Client) Call(
+	ctx context.Context,
+	method string,
+	params interface{},
+) (payload []byte, err error) {
 	if params == nil {
 		payload = []byte{'{', '}'}
 	} else {
 		payload, err = json.Marshal(params)
 		if err != nil {
-			return
+			return nil, err
 		}
 	}
-	payload, err = c.RawRequest(method, payload)
-	return
+	return c.CallBytes(ctx, method, payload)
 }
 
-// TODO(tav): Minimise string allocation by writing to a
-// buffer of some kind.
-func (c *Client) RawRequest(method string, payload []byte) ([]byte, error) {
+// CallBytes makes and retries request with raw bytes
+func (c *Client) CallBytes(
+	ctx context.Context,
+	method string,
+	payload []byte,
+) ([]byte, error) {
+	attempt := 0
+	for {
+		b, err := c.callRaw(ctx, method, payload)
+		if err == nil {
+			return b, nil
+		}
+
+		if e, ok := err.(Error); ok {
+			if e.Retry() {
+				attempt++
+				if attempt >= c.Retry {
+					return nil, ErrRetryExhausted
+				}
+				c.backoff(attempt)
+			} else {
+				return nil, e
+			}
+		} else {
+			return nil, err
+		}
+	}
+}
+
+const backoffFactor = 50 * time.Millisecond
+
+// block exponentially where exponent is attempt
+func (c *Client) backoff(attempt int) {
+	<-time.After(time.Duration(math.Pow(2, float64(attempt))) * backoffFactor)
+}
+
+func (c *Client) callRaw(
+	ctx context.Context,
+	method string,
+	payload []byte,
+) ([]byte, error) {
+	// new request
+	req, err := c.newRequest(method, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	// send request
+	resp, err := c.do(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// decode response
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		err := Error{
+			Body:       body,
+			StatusCode: resp.StatusCode,
+		}
+		log.Printf("%v", string(body))
+		return nil, err
+	}
+	return body, nil
+}
+
+// TODO: use a buffer to reduce string allocations like bmizerany/aws4
+func (c *Client) newRequest(
+	method string,
+	payload []byte,
+) (*http.Request, error) {
 	req, err := http.NewRequest("POST", c.endpoint.url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
@@ -493,39 +745,42 @@ func (c *Client) RawRequest(method string, payload []byte) ([]byte, error) {
 	req.Header.Set("Host", c.endpoint.host)
 	req.Header.Set("X-Amz-Date", datetime)
 	req.Header.Set("X-Amz-Target", method)
-	resp, err := c.web.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != 200 {
-		err := Error{
-			Body:       body,
-			StatusCode: resp.StatusCode,
+	return req, nil
+}
+
+// do sends request and enforces context deadline
+func (c *Client) do(
+	ctx context.Context,
+	req *http.Request,
+) (*http.Response, error) {
+	// start
+	errc := make(chan error, 1)
+	var resp *http.Response
+	go func() {
+		var err error
+		resp, err = c.web.Do(req)
+		errc <- err
+	}()
+
+	// pick whichever happens first
+	select {
+	case <-ctx.Done():
+		// interface check here to accept less capable http.RoundTripper
+		type canceler interface {
+			CancelRequest(*http.Request)
 		}
-		log.Printf("%v", string(body))
-		return nil, err
+		if tr, ok := c.transport.(canceler); ok {
+			tr.CancelRequest(req)
+		}
+		<-errc
+		return nil, ctx.Err()
+	case err := <-errc:
+		return resp, err
 	}
-	return body, nil
 }
 
 func doHMAC(key []byte, data string) []byte {
 	h := hmac.New(sha256.New, key)
 	h.Write([]byte(data))
 	return h.Sum(nil)
-}
-
-func Dial(region endpoint, creds auth, transport http.RoundTripper) *Client {
-	if transport == nil {
-		transport = &http.Transport{}
-	}
-	return &Client{
-		auth:     creds,
-		endpoint: region,
-		web:      &http.Client{Transport: transport},
-	}
 }
